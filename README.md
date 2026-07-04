@@ -16,7 +16,7 @@ by Elvan
 ### Linux
 
 ```bash
-git clone https://github.com/elvan/netband.git
+git clone https://github.com/Elvandito/netband.git
 cd netband
 sudo python3 setup.py install
 ```
@@ -26,7 +26,7 @@ sudo python3 setup.py install
 ```bash
 pkg update && pkg upgrade
 pkg install python scapy root-repo
-git clone https://github.com/elvan/netband.git
+git clone https://github.com/Elvandito/netband.git
 cd netband
 sudo python3 setup.py install
 ```
