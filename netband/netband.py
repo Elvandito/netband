@@ -359,7 +359,7 @@ class Limiter:
 
 # ── scan ─────────────────────────────────────────────────────────────
 
-def scan(iface, gw_ip, custom=None):
+def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None):
     if custom:
         parts = custom.split("-")
         start, end = parts[0].strip(), parts[1].strip()
@@ -378,17 +378,24 @@ def scan(iface, gw_ip, custom=None):
         ip_list = " ".join(f"{net}.{i}" for i in range(1, 255))
 
     print(f"{C.DIM}Scanning ...{C.RST}")
-    sh(f"for i in {ip_list}; do ping -c1 -W0.2 $i &>/dev/null & done; wait")
+    # clear ARP cache for this interface
+    sh(f"ip neigh flush dev {iface} nud failed nud incomplete 2>/dev/null")
+    # ping sweep
+    sh(f"for i in {ip_list}; do ping -c1 -W0.5 $i &>/dev/null & done; wait")
+    time.sleep(0.5)
 
     devices = load(DEVICES_FILE)
     idx = max((d["id"] for d in devices.values()), default=0) + 1
     seen = set()
 
+    # collect currently reachable MACs (only REACHABLE/DELAY/PROBE, not STALE)
     for line in sh(f"ip neigh show dev {iface}").splitlines():
         p = line.split()
         if len(p) < 4: continue
         ip, ll, mac, state = p[0], p[1], p[2], p[3]
-        if ll != "lladdr" or state in ("FAILED","INCOMPLETE","NONE"): continue
+        if ll != "lladdr": continue
+        # only trust confirmed connections
+        if state not in ("REACHABLE", "DELAY", "PROBE"): continue
         if mac == "00:00:00:00:00:00" or ":" not in mac: continue
         mac = mac.lower()
         if mac in seen: continue
@@ -604,7 +611,7 @@ def main():
 
         elif cmd == "scan":
             custom = arg.split("--range",1)[1].strip() if "--range" in arg else None
-            devices = scan(iface, gw_ip, custom)
+            devices = scan(iface, gw_ip, custom, limiter, spoofer)
             print(f"\n{C.BLD}Found {len(devices)} hosts:{C.RST}")
             _print_host_table(devices, gw_ip, limiter)
 
