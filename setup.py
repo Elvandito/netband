@@ -23,7 +23,7 @@ def get_init_content():
 
 
 def get_version():
-    version_match = re.search(r'^__version__ = [\'"](\d\.\d\.\d)[\'"]', get_init_content(), re.M)
+    version_match = re.search(r'^__version__ = [\'"](\d+\.\d+(?:\.\d+)?)[\'"]', get_init_content(), re.M)
     if version_match:
         return version_match.group(1)
     raise RuntimeError('Unable to locate version string.')
@@ -41,7 +41,7 @@ AUTHOR = 'elvan'
 AUTHOR_EMAIL = ''
 LICENSE = 'MIT'
 VERSION = get_version()
-URL = 'https://github.com/elvan/netband'
+URL = 'https://github.com/Elvandito/netband'
 DESCRIPTION = get_description()
 KEYWORDS = ["netband", "limit", "bandwidth", "network", "arp"]
 PACKAGES = find_packages()
@@ -64,7 +64,10 @@ PYTHON_REQUIRES = '>= 3.8'
 ENTRY_POINTS = {
     'console_scripts': ['netband = netband.netband:main']
 }
-INSTALL_REQUIRES = ['scapy']
+INSTALL_REQUIRES = [
+    'setuptools',
+    'scapy',
+]
 CMDCLASS = {'clean': CleanCommand}
 
 

@@ -25,11 +25,15 @@ sudo python3 setup.py install
 
 ```bash
 pkg update && pkg upgrade
-pkg install python scapy root-repo
+pkg install python root-repo
+pip install setuptools scapy
 git clone https://github.com/Elvandito/netband.git
 cd netband
 sudo python3 setup.py install
+sudo netband
 ```
+
+**Note:** Requires rooted Android device with Termux installed from F-Droid (not Play Store).
 
 ## Usage
 
