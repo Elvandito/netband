@@ -359,7 +359,7 @@ class Limiter:
 
 # ── scan ─────────────────────────────────────────────────────────────
 
-def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None):
+def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
     if custom:
         parts = custom.split("-")
         start, end = parts[0].strip(), parts[1].strip()
@@ -385,7 +385,15 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None):
     time.sleep(0.5)
 
     devices = load(DEVICES_FILE)
-    idx = max((d["id"] for d in devices.values()), default=0) + 1
+    active_devices = {}
+
+    # Pre-populate active_devices with hosts that are currently limited or blocked
+    # so we don't discard them even if they are offline right now.
+    for mac, d in devices.items():
+        if limiter and limiter.is_limited(d["ip"]):
+            d["online"] = False
+            active_devices[mac] = d
+
     seen = set()
 
     # collect currently reachable MACs (only REACHABLE/DELAY/PROBE, not STALE)
@@ -400,17 +408,80 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None):
         mac = mac.lower()
         if mac in seen: continue
         seen.add(mac)
-        if mac in devices:
-            devices[mac]["ip"] = ip
-            continue
-        hn = ""
-        try: hn = __import__("socket").gethostbyaddr(ip)[0]
-        except: pass
-        devices[mac] = {"id": idx, "ip": ip, "mac": mac, "hostname": hn, "limits": {}}
-        idx += 1
 
-    save(DEVICES_FILE, devices)
-    return devices
+        if mac in active_devices:
+            active_devices[mac]["ip"] = ip
+            active_devices[mac]["online"] = True
+        elif mac in devices:
+            active_devices[mac] = devices[mac]
+            active_devices[mac]["ip"] = ip
+            active_devices[mac]["online"] = True
+        else:
+            hn = ""
+            try: hn = __import__("socket").gethostbyaddr(ip)[0]
+            except: pass
+            active_devices[mac] = {"id": -1, "ip": ip, "mac": mac, "hostname": hn, "limits": {}, "online": True}
+
+    # Ensure Gateway is in active_devices
+    if gw_mac:
+        gw_mac_lower = gw_mac.lower()
+        if gw_mac_lower not in active_devices:
+            if gw_mac_lower in devices:
+                active_devices[gw_mac_lower] = devices[gw_mac_lower]
+                active_devices[gw_mac_lower]["ip"] = gw_ip
+                active_devices[gw_mac_lower]["online"] = True
+            else:
+                active_devices[gw_mac_lower] = {
+                    "id": 0,
+                    "ip": gw_ip,
+                    "mac": gw_mac_lower,
+                    "hostname": "gateway",
+                    "limits": {},
+                    "online": True
+                }
+
+    # Re-index all active devices: Gateway gets ID 0, others sorted by IP numerically
+    gw_device = None
+    if gw_mac:
+        gw_device = active_devices.pop(gw_mac.lower(), None)
+    else:
+        # search by IP if gw_mac is not supplied
+        for mac, d in list(active_devices.items()):
+            if d["ip"] == gw_ip:
+                gw_device = active_devices.pop(mac)
+                break
+
+    def ip_key(item):
+        try:
+            return list(map(int, item[1]["ip"].split(".")))
+        except:
+            return [999, 999, 999, 999]
+
+    sorted_non_gw = sorted(active_devices.items(), key=ip_key)
+
+    rebuilt_devices = {}
+    if gw_device:
+        gw_device["id"] = 0
+        # For the gateway, keep hostname as gateway or its resolved hostname
+        if not gw_device["hostname"] or gw_device["hostname"] == gw_ip:
+            gw_device["hostname"] = "gateway"
+        rebuilt_devices[gw_device["mac"]] = gw_device
+    elif gw_mac:
+        rebuilt_devices[gw_mac.lower()] = {
+            "id": 0,
+            "ip": gw_ip,
+            "mac": gw_mac.lower(),
+            "hostname": "gateway",
+            "limits": {},
+            "online": True
+        }
+
+    for idx, (mac, d) in enumerate(sorted_non_gw, start=1):
+        d["id"] = idx
+        rebuilt_devices[mac] = d
+
+    save(DEVICES_FILE, rebuilt_devices)
+    return rebuilt_devices
 
 # ── watch ────────────────────────────────────────────────────────────
 
@@ -472,19 +543,20 @@ def parse_ids(raw, devices):
 # ── banner ───────────────────────────────────────────────────────────
 
 def print_banner(iface, gw_ip, gw_mac, local_ip):
-    mode = f"{C.YEL}[Android/raw-socket mode]{C.RST}" if IS_ANDROID else ""
-    print(f"""{C.RED}
-    _   __     __ _            __
-   / | / /__  / / (_)___  ____/ /__  _________  ____
-  /  |/ / _ \\/ / / /_  / / __  / _ \\/ ___/ __ \\/ __ \\
- / /|  /  __/ /_/ / / / / /_/ /  __/ /  / /_/ / / / /
-/_/ |_/\\___/\\____/_/ /_/\\__,_/\\___/_/   \\____/_/ /_/
-{C.RST}{C.DIM}  ARP-based bandwidth manager v{VERSION} by Elvan{C.RST} {mode}
-
-  {C.CYN}Interface:{C.RST} {iface}
-  {C.CYN}Local IP: {C.RST} {local_ip}
-  {C.CYN}Gateway:  {C.RST} {gw_ip} ({gw_mac})
-  {C.DIM}Type 'help' for commands{C.RST}
+    mode = f" {C.YEL}[Android/raw-socket mode]{C.RST}" if IS_ANDROID else ""
+    print("")
+    print(f"""{C.RED}   ███╗  ██╗███████╗████████╗██████╗  █████╗ ███╗  ██╗██████╗
+   ████╗ ██║██╔════╝╚══██╔══╝██╔══██╗██╔══██╗████╗ ██║██╔══██╗
+   ██╔██╗██║█████╗     ██║   ██████╔╝███████║██╔██╗██║██║  ██║
+   ██║╚████║██╔══╝     ██║   ██╔══██╗██╔══██║██║╚████║██║  ██║
+   ██║ ╚███║███████╗   ██║   ██████╔╝██║  ██║██║ ╚███║██████╔╝
+   ╚═╝  ╚══╝╚══════╝   ╚═╝   ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚══╝╚═════╝{C.RST}
+   {C.DIM}by Elvan ~ limit devices on your network    v{VERSION}{C.RST}
+  {C.DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RST}
+   {C.CYN}Interface:{C.RST} {iface}    
+   {C.CYN}Local IP:{C.RST}  {local_ip}
+   {C.CYN}Gateway:  {C.RST} {gw_ip} ({gw_mac}){mode}
+  {C.DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RST}
 """)
 
 # ── help ─────────────────────────────────────────────────────────────
@@ -521,9 +593,18 @@ def _print_host_table(devices, gw_ip, limiter):
     print(C.DIM + "-" * len(hdr.replace(C.CYN,"").replace(C.RST,"")) + C.RST)
     for mac, d in sorted(devices.items(), key=lambda x: x[1]["id"]):
         is_gw = d["ip"] == gw_ip
+        is_online = d.get("online", True)
         info = limiter.get_status(d["ip"])
         if is_gw:
             status = f"{C.MAG}gateway{C.RST}"
+        elif not is_online:
+            if info:
+                if info["blocked"]:
+                    status = f"{C.DIM}offline {C.RED}(blocked){C.RST}"
+                else:
+                    status = f"{C.DIM}offline {C.YEL}({info['rate']}){C.RST}"
+            else:
+                status = f"{C.DIM}offline{C.RST}"
         elif info:
             if info["blocked"]:
                 status = f"{C.RED}blocked {Dir.icon(info['dir'])}{C.RST}"
@@ -611,7 +692,7 @@ def main():
 
         elif cmd == "scan":
             custom = arg.split("--range",1)[1].strip() if "--range" in arg else None
-            devices = scan(iface, gw_ip, custom, limiter, spoofer)
+            devices = scan(iface, gw_ip, custom, limiter, spoofer, gw_mac)
             print(f"\n{C.BLD}Found {len(devices)} hosts:{C.RST}")
             _print_host_table(devices, gw_ip, limiter)
 
@@ -658,9 +739,8 @@ def main():
                 spoofer.add(d["ip"], d["mac"])
                 limiter.block(d["ip"], direction)
                 d["limits"] = {"rate": None, "direction": direction, "blocked": True}
+                print(f"{C.RED}Blocked {d['ip']}{C.RST}")
             save(DEVICES_FILE, devices)
-            ips = ", ".join(d["ip"] for d in devs if d["ip"] != gw_ip)
-            print(f"{C.GRN}Blocked {ips}{C.RST}")
 
         elif cmd == "free":
             if not arg:
@@ -672,9 +752,8 @@ def main():
                 limiter.unlimit(d["ip"])
                 spoofer.remove(d["ip"])
                 d["limits"] = {}
+                print(f"{C.GRN}Freed {d['ip']}{C.RST}")
             save(DEVICES_FILE, devices)
-            ips = ", ".join(d["ip"] for d in devs)
-            print(f"{C.GRN}Freed {ips}{C.RST}")
 
         elif cmd == "add":
             if not arg:

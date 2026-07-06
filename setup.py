@@ -2,6 +2,7 @@
 import os
 import re
 from setuptools import setup, find_packages, Command
+from setuptools.command.install import install
 
 
 class CleanCommand(Command):
@@ -15,6 +16,25 @@ class CleanCommand(Command):
 
     def run(self):
         os.system('rm -vrf ./build ./dist ./*.pyc ./*.pyo ./*.pyd ./*.tgz ./*.egg-info `find -type d -name __pycache__`')
+
+
+class InstallCommand(install):
+    def run(self):
+        super().run()
+        if os.name == 'posix':
+            src = '/usr/local/bin/netband'
+            dst = '/usr/bin/netband'
+            if os.path.exists(src):
+                if os.path.exists(dst) or os.path.islink(dst):
+                    try:
+                        os.remove(dst)
+                    except Exception:
+                        pass
+                try:
+                    os.symlink(src, dst)
+                    print(f"Created symlink: {dst} -> {src}")
+                except Exception as e:
+                    print(f"Warning: Could not create symlink {dst} -> {src}: {e}")
 
 
 def get_init_content():
@@ -68,7 +88,10 @@ INSTALL_REQUIRES = [
     'setuptools',
     'scapy',
 ]
-CMDCLASS = {'clean': CleanCommand}
+CMDCLASS = {
+    'clean': CleanCommand,
+    'install': InstallCommand,
+}
 
 
 setup(
@@ -88,3 +111,4 @@ setup(
     url=URL,
     cmdclass=CMDCLASS,
 )
+
