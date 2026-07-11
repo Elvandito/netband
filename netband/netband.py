@@ -93,15 +93,41 @@ def _send_raw_arp(iface, pkt):
 
 # ── detection ────────────────────────────────────────────────────────
 
+def _detect_route_proc():
+    try:
+        lines = Path("/proc/net/route").read_text().splitlines()
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] == "00000000" and parts[2] != "00000000":
+                iface = parts[0]
+                gw_hex = parts[2]
+                b = bytes.fromhex(gw_hex)
+                gw_ip = f"{b[3]}.{b[2]}.{b[1]}.{b[0]}"
+                return iface, gw_ip
+    except Exception:
+        pass
+    return None, None
+
 def detect_iface():
+    iface, _ = _detect_route_proc()
+    if iface: return iface
     m = re.search(r"dev\s+(\S+)", sh("ip route show default"))
     return m.group(1) if m else None
 
 def detect_gw():
+    _, gw = _detect_route_proc()
+    if gw: return gw
     m = re.search(r"via\s+(\S+)", sh("ip route show default"))
     return m.group(1) if m else None
 
 def get_mac(ip, iface=None):
+    # Trigger routing cache/ARP lookup natively by sending a UDP dummy payload
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.sendto(b"", (ip, 1))
+        s.close()
+    except Exception:
+        pass
     # 1. ip neigh (fast, no root needed)
     out = sh(f"ip neigh show {ip}")
     m = re.search(r"lladdr\s+([0-9a-fA-F:]{17})", out)
@@ -118,6 +144,17 @@ def get_mac(ip, iface=None):
     return None
 
 def get_local_ip(iface):
+    # Try local interface IP via socket connect (native, no subprocess)
+    try:
+        gw_ip = detect_gw()
+        if gw_ip:
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            s.connect((gw_ip, 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+    except Exception:
+        pass
     m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", sh(f"ip -4 addr show dev {iface}"))
     return m.group(1) if m else None
 
