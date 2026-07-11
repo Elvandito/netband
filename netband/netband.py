@@ -30,7 +30,25 @@ WATCH_FILE = CONFIG_DIR / "watch.json"
 TC = "tc"
 IPT = "iptables"
 SYSCTL = "sysctl"
+ARPING = "arping"
 IP_FWD = "net.ipv4.ip_forward"
+
+if IS_ANDROID:
+    def find_bin(name):
+        paths = [
+            f"/data/data/com.termux/files/usr/bin/{name}",
+            f"/data/data/com.termux/files/usr/bin/applets/{name}",
+            f"/system/bin/{name}",
+            f"/system/xbin/{name}",
+            f"/vendor/bin/{name}",
+        ]
+        for p in paths:
+            if os.path.exists(p): return p
+        return name
+    TC = find_bin("tc")
+    IPT = find_bin("iptables")
+    SYSCTL = find_bin("sysctl")
+    ARPING = find_bin("arping")
 
 # ── colors ───────────────────────────────────────────────────────────
 
@@ -90,7 +108,7 @@ def get_mac(ip, iface=None):
     if m: return m.group(1).lower()
     # 2. arping fallback (works on Android with root)
     iface_flag = f"-I {iface}" if iface else ""
-    out2 = sh(f"arping -c 2 -f {iface_flag} {ip} 2>/dev/null")
+    out2 = sh(f"{ARPING} -c 2 -f {iface_flag} {ip} 2>/dev/null")
     m2 = re.search(r"\[([0-9a-fA-F:]{17})\]", out2)
     if m2: return m2.group(1).lower()
     # 3. Scapy — desktop Linux only
@@ -372,17 +390,34 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
                 for c in range(s[2] if a==s[0] and b==s[1] else 0, e[2]+1 if a==e[0] and b==e[1] else 255):
                     for d in range(s[3] if a==s[0] and b==s[1] and c==s[2] else 1, e[3]+1 if a==e[0] and b==e[1] and c==e[2] else 255):
                         ips.append(f"{a}.{b}.{c}.{d}")
-        ip_list = " ".join(ips)
     else:
         net = ".".join(gw_ip.split(".")[:3])
-        ip_list = " ".join(f"{net}.{i}" for i in range(1, 255))
+        ips = [f"{net}.{i}" for i in range(1, 255)]
 
     print(f"{C.DIM}Scanning ...{C.RST}")
     # clear ARP cache for this interface
     sh(f"ip neigh flush dev {iface} nud failed nud incomplete 2>/dev/null")
-    # ping sweep
-    sh(f"for i in {ip_list}; do ping -c1 -W0.5 $i &>/dev/null & done; wait")
-    time.sleep(0.5)
+
+    local_mac = spoofer.local_mac if spoofer else get_mac(get_local_ip(iface), iface)
+    local_ip = spoofer.local_ip if spoofer else get_local_ip(iface)
+
+    # ponytail: raw ARP scan relies on raw socket capability and system euid=0;
+    # it bypasses external command spawning completely, eliminating mobile device hangs.
+    # Upgrade path: Support IPv6 NDP solicitation sweep if IPv6 target scanning is requested.
+    if local_mac and local_ip:
+        for ip in ips:
+            # op=1 is ARP request, dst_mac is BROADCAST
+            pkt = _arp_packet(local_mac, local_ip, BROADCAST, ip, op=1)
+            _send_raw_arp(iface, pkt)
+            time.sleep(0.002)
+        time.sleep(1.0)
+    else:
+        # Fallback to chunked ping sweep (max 32 concurrent processes to prevent Android resource exhaustion)
+        chunks = [ips[i:i + 32] for i in range(0, len(ips), 32)]
+        for chunk in chunks:
+            ip_list = " ".join(chunk)
+            sh(f"for i in {ip_list}; do ping -c1 -W1 $i &>/dev/null & done; wait")
+        time.sleep(0.5)
 
     devices = load(DEVICES_FILE)
     active_devices = {}
@@ -817,25 +852,100 @@ def main():
             devs = parse_ids(w[0], devices)
             if not devs:
                 print(f"{C.RED}No matching hosts.{C.RST}"); continue
-            print(f"{C.BLD}Analyzing {len(devs)} host(s) for {duration}s ...{C.RST}")
-            prev = get_traffic()
+            
+            print(f"{C.BLD}Initializing passive analysis for {len(devs)} host(s)...{C.RST}")
+            # Set up iptables accounting chain
+            shq(f"{IPT} -N NETBAND_ACCT")
+            shq(f"{IPT} -I FORWARD -j NETBAND_ACCT")
+            
+            # Start ARP spoofing and insert accounting rules
+            spoofed_ips = []
+            for d in devs:
+                if d["ip"] == gw_ip: continue
+                # Only spoof if not already spoofing (i.e. not limited/blocked)
+                if not limiter.is_limited(d["ip"]):
+                    spoofer.add(d["ip"], d["mac"])
+                    spoofed_ips.append(d["ip"])
+                # Add accounting rules (no target means pure byte/packet accounting)
+                shq(f"{IPT} -A NETBAND_ACCT -s {d['ip']}")
+                shq(f"{IPT} -A NETBAND_ACCT -d {d['ip']}")
+
+            print(f"{C.BLD}Analyzing (Ctrl+C to stop)...{C.RST}")
+            
+            # ponytail: passive analysis relies on iptables accounting which only tracks IPv4 routed traffic;
+            # IPv6 or local subnet-to-subnet traffic not routed through our interface is not counted.
+            # Upgrade path: Use scapy sniff or raw sockets to capture and parse all packet headers.
+            
+            # Helper to parse bytes from iptables
+            def read_bytes():
+                data = {}
+                out = sh(f"{IPT} -L NETBAND_ACCT -n -v -x")
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) == 8:
+                        try:
+                            bytes_cnt = int(parts[1])
+                            src = parts[6]
+                            dst = parts[7]
+                            if dst == "0.0.0.0/0":
+                                # This is from source IP (TX from host)
+                                if src not in data: data[src] = {"tx": 0, "rx": 0}
+                                data[src]["tx"] = bytes_cnt
+                            elif src == "0.0.0.0/0":
+                                # This is to destination IP (RX to host)
+                                if dst not in data: data[dst] = {"tx": 0, "rx": 0}
+                                data[dst]["rx"] = bytes_cnt
+                        except ValueError:
+                            pass
+                return data
+
+            prev_bytes = read_bytes()
+            prev_time = time.time()
             start = time.time()
+            
             try:
                 while time.time() - start < duration:
                     time.sleep(2)
-                    curr = get_traffic()
-                    elapsed = time.time() - start
-                    dt = elapsed - (elapsed - 2) if elapsed > 2 else 2
+                    now = time.time()
+                    dt = now - prev_time
+                    if dt <= 0: dt = 1
+                    
+                    curr_bytes = read_bytes()
+                    elapsed = now - start
+                    
                     print(f"\n{C.CYN}[{elapsed:.0f}s] {'ID':<4} {'IP':<16} {'Hostname':<20} {'RX/s':>10} {'TX/s':>10}{C.RST}")
                     print("-" * 66)
-                    if iface in prev and iface in curr:
-                        total_rx = curr[iface]["rx"] - prev[iface]["rx"]
-                        total_tx = curr[iface]["tx"] - prev[iface]["tx"]
-                        for d in devs:
+                    
+                    total_rx_sec = 0
+                    total_tx_sec = 0
+                    for d in devs:
+                        if d["ip"] == gw_ip:
                             print(f"    {d['id']:<4} {d['ip']:<16} {d['hostname'][:20]:<20} {'-':>10} {'-':>10}")
-                        print(f"{C.DIM}Total: RX {_fmt(total_rx/dt)}/s  TX {_fmt(total_tx/dt)}/s{C.RST}")
-                    prev = curr
-            except KeyboardInterrupt: pass
+                            continue
+                        
+                        rx_val = curr_bytes.get(d["ip"], {}).get("rx", 0) - prev_bytes.get(d["ip"], {}).get("rx", 0)
+                        tx_val = curr_bytes.get(d["ip"], {}).get("tx", 0) - prev_bytes.get(d["ip"], {}).get("tx", 0)
+                        if rx_val < 0: rx_val = 0
+                        if tx_val < 0: tx_val = 0
+                        
+                        total_rx_sec += rx_val
+                        total_tx_sec += tx_val
+                        
+                        print(f"    {d['id']:<4} {d['ip']:<16} {d['hostname'][:20]:<20} {_fmt(rx_val / dt):>10} {_fmt(tx_val / dt):>10}")
+                    
+                    print(f"{C.DIM}Total: RX {_fmt(total_rx_sec / dt)}/s  TX {_fmt(total_tx_sec / dt)}/s{C.RST}")
+                    prev_bytes = curr_bytes
+                    prev_time = now
+            except KeyboardInterrupt:
+                pass
+            finally:
+                # Cleanup accounting iptables rules
+                shq(f"{IPT} -D FORWARD -j NETBAND_ACCT")
+                shq(f"{IPT} -F NETBAND_ACCT")
+                shq(f"{IPT} -X NETBAND_ACCT")
+                # Remove from spoofer if they were not limited/blocked
+                for ip in spoofed_ips:
+                    spoofer.remove(ip)
             print(f"\n{C.DIM}Done.{C.RST}")
 
         elif cmd == "status":
