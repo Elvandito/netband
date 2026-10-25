@@ -4,7 +4,7 @@ netband - ARP-based local network bandwidth manager.
 Usage: sudo netband [-i IFACE] [-g GW_IP] [-m GW_MAC] [--colorless] [-f]
 """
 
-import os, sys, re, time, json, signal, argparse, threading, struct
+import os, sys, re, time, json, signal, argparse, threading, struct, ctypes
 import socket as _socket
 import ipaddress
 import subprocess
@@ -19,7 +19,7 @@ IS_WINDOWS = os.name == "nt"
 _stderr = sys.stderr
 sys.stderr = open(os.devnull, 'w')
 try:
-    from scapy.all import ARP, Ether, sendp, sr1
+    from scapy.all import ARP, Ether, sendp, sr1, srp
     import warnings; warnings.filterwarnings("ignore")
     SCAPY_OK = not IS_ANDROID
 except ImportError:
@@ -100,7 +100,11 @@ def sh(cmd):
 
 def shq(cmd):
     if IS_WINDOWS:
-        # Turn PowerShell terminating errors into a non-zero process result.
+        if cmd.startswith("netsh "):
+            try:
+                return subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).returncode
+            except (OSError, subprocess.SubprocessError):
+                return 1
         script = "$ErrorActionPreference='Stop'; try { " + cmd + "; exit 0 } catch { exit 1 }"
         try:
             r = subprocess.run(
@@ -137,45 +141,83 @@ def _send_raw_arp(iface, pkt):
 
 # ── detection ────────────────────────────────────────────────────────
 
-def _detect_network():
-    iface, gw_ip = None, None
+def _is_lan_iface(name):
+    return not str(name).startswith(("lo", "tun", "tap", "wg", "ppp", "rmnet", "ccmni", "veth", "docker", "br-", "virbr"))
+
+def _detect_network(prefer_iface=None):
+    iface, gw_ip = prefer_iface, None
     if IS_WINDOWS:
-        out = sh("Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway} | Select-Object -First 1 InterfaceAlias,IPv4DefaultGateway | ConvertTo-Json -Compress")
+        flt = f"$_.InterfaceAlias -eq {_ps_quote(prefer_iface)}" if prefer_iface else "$_.IPv4DefaultGateway -ne $null"
+        out = sh(
+            f"Get-NetIPConfiguration | Where-Object {{{flt}}} | Select-Object -First 1 "
+            "InterfaceAlias,@{N='Gateway';E={$_.IPv4DefaultGateway.NextHop}} | ConvertTo-Json -Compress"
+        )
         try:
-            d = json.loads(out)
-            gw = d.get("IPv4DefaultGateway")
-            if isinstance(gw, list): gw = gw[0]
-            return d.get("InterfaceAlias"), gw.get("NextHop") if gw else None
+            d = json.loads(out) if out else {}
+            if isinstance(d, list): d = d[0] if d else {}
+            gw = d.get("Gateway")
+            if isinstance(gw, list): gw = gw[0] if gw else None
+            iface = iface or d.get("InterfaceAlias")
+            gw_ip = str(gw).strip() if gw else None
         except Exception:
-            return None, None
+            pass
+        if not iface:
+            iface = sh("Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -First 1 -ExpandProperty Name").splitlines()[0].strip() or None
+        return iface, gw_ip
+
     try:
-        lines = Path("/proc/net/route").read_text().splitlines()
-        for line in lines[1:]:
+        lines = Path("/proc/net/route").read_text().splitlines()[1:]
+        routes = []
+        for line in lines:
             parts = line.split()
             if len(parts) >= 3 and parts[1] == "00000000" and parts[2] != "00000000":
-                iface = parts[0]
-                gw_ip = _socket.inet_ntoa(struct.pack("<L", int(parts[2], 16)))
-                return iface, gw_ip
-    except Exception: pass
+                dev = parts[0]
+                gw = _socket.inet_ntoa(struct.pack("<L", int(parts[2], 16)))
+                if prefer_iface and dev == prefer_iface:
+                    return dev, gw
+                routes.append((dev, gw))
+        for dev, gw in routes:
+            if _is_lan_iface(dev): return dev, gw
+        if routes and not prefer_iface:
+            return routes[0]
+    except Exception:
+        pass
 
-    out = sh("ip route show table all 2>/dev/null")
-    for line in out.splitlines():
-        m = re.search(r"default\s+via\s+([0-9\.]+)\s+dev\s+(\S+)", line)
-        if m: return m.group(2), m.group(1)
+    for cmd in ("ip -4 route show default", "ip route show table all", "ip route"):
+        out = sh(f"{cmd} 2>/dev/null")
+        fallback = None
+        for line in out.splitlines():
+            m = re.search(r"default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\S+)", line)
+            if not m: continue
+            gw, dev = m.group(1), m.group(2)
+            if prefer_iface and dev == prefer_iface:
+                return dev, gw
+            if _is_lan_iface(dev):
+                return dev, gw
+            if not fallback:
+                fallback = (dev, gw)
+        if fallback and not prefer_iface:
+            iface, gw_ip = fallback
+            break
 
-    out = sh("ip route 2>/dev/null")
-    for line in out.splitlines():
-        m = re.search(r"default\s+via\s+([0-9\.]+)\s+dev\s+(\S+)", line)
-        if m: return m.group(2), m.group(1)
-
-    if IS_ANDROID:
+    if IS_ANDROID and (not iface or not gw_ip):
         out = sh("dumpsys connectivity 2>/dev/null")
-        m = re.search(r"0\.0\.0\.0/0\s*->\s*([0-9\.]+)\s+(\S+)", out)
-        if m: return m.group(2), m.group(1)
-        out = sh("dumpsys wifi 2>/dev/null")
-        m_gw = re.search(r"(?i)gateway[:=]\s*([0-9\.]+)", out)
-        if m_gw: gw_ip = m_gw.group(1)
-        iface = sh("getprop wifi.interface 2>/dev/null").strip() or iface
+        m = re.search(r"0\.0\.0\.0/0\s*->\s*(\d+\.\d+\.\d+\.\d+)\s+(\S+)", out)
+        if m:
+            iface = iface or m.group(2)
+            gw_ip = gw_ip or m.group(1)
+        if not gw_ip:
+            m_gw = re.search(r"(?i)gateway[:=]\s*(\d+\.\d+\.\d+\.\d+)", sh("dumpsys wifi 2>/dev/null"))
+            if m_gw: gw_ip = m_gw.group(1)
+        if not iface:
+            iface = sh("getprop wifi.interface 2>/dev/null").strip() or None
+
+    if not iface:
+        for line in sh("ip -o -4 addr show up scope global 2>/dev/null").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and _is_lan_iface(parts[1]):
+                iface = parts[1]
+                break
 
     return iface, gw_ip
 
@@ -203,13 +245,13 @@ def get_local_ip(iface):
             except Exception: pass
 
 def detect_gw(iface=None):
-    _, g = _detect_network()
+    _, g = _detect_network(iface)
     if g: return g
     if iface:
         loc = get_local_ip(iface)
         if loc:
             net = ".".join(loc.split(".")[:3])
-            for last in ["1", "254", "0"]:
+            for last in ["1", "254"]:
                 test_gw = f"{net}.{last}"
                 if test_gw == loc:
                     continue
@@ -235,23 +277,26 @@ def get_mac(ip, iface=None):
     if IS_WINDOWS:
         try:
             subprocess.run(["ping", "-n", "1", "-w", "700", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-            out = sh(f"Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{$_.IPAddress -eq {_ps_quote(ip)}}} | Select-Object -First 1 -ExpandProperty LinkLayerAddress")
-            if out and re.fullmatch(r"(?i)[0-9a-f]{2}([-:][0-9a-f]{2}){5}", out.strip()):
-                return out.strip().replace("-", ":").lower()
             out = subprocess.run(["arp", "-a", ip], capture_output=True, text=True, timeout=2).stdout
             m = re.search(r"([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})", out)
             if m: return m.group(1).replace("-", ":").lower()
+            out = sh(f"Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{$_.IPAddress -eq {_ps_quote(ip)}}} | Select-Object -First 1 -ExpandProperty LinkLayerAddress")
+            if out and re.fullmatch(r"(?i)[0-9a-f]{2}([-:][0-9a-f]{2}){5}", out.strip()):
+                return out.strip().replace("-", ":").lower()
         except Exception: pass
         return None
-    # Trigger ARP by connecting UDP
     try:
         s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         s.settimeout(0.1)
         s.sendto(b"", (ip, 1))
         s.close()
     except Exception: pass
+    if iface:
+        loc_ip, loc_mac = get_local_ip(iface), get_local_mac(iface)
+        if loc_ip and loc_mac and loc_mac != "00:00:00:00:00:00":
+            _send_raw_arp(iface, _arp_packet(loc_mac, loc_mac, loc_ip, BROADCAST, BROADCAST, ip, op=1))
+            time.sleep(0.05)
 
-    # Read kernel ARP table
     try:
         for line in open("/proc/net/arp").read().splitlines()[1:]:
             parts = line.split()
@@ -260,12 +305,10 @@ def get_mac(ip, iface=None):
                 if mac != "00:00:00:00:00:00": return mac
     except Exception: pass
 
-    # ip neigh
     out = sh(f"ip neigh show {ip} 2>/dev/null")
     m = re.search(r"lladdr\s+([0-9a-fA-F:]{17})", out)
     if m: return m.group(1).lower()
 
-    # arping
     iface_flag = f"-I {shlex.quote(str(iface))}" if iface else ""
     out2 = sh(f"{ARPING} -c 2 -w 2 -f {iface_flag} {ip} 2>/dev/null")
     m2 = re.search(r"\[([0-9a-fA-F:]{17})\]", out2)
@@ -282,7 +325,9 @@ def get_local_mac(iface):
     """Get local MAC, multiple fallbacks."""
     if IS_WINDOWS:
         out = sh(f"Get-NetAdapter -Name {_ps_quote(iface)} -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty MacAddress")
-        return out.strip().replace("-", ":").lower() if out else "00:00:00:00:00:00"
+        if out and re.fullmatch(r"(?i)[0-9a-f]{2}([-:][0-9a-f]{2}){5}", out.strip()):
+            return out.strip().replace("-", ":").lower()
+        return "00:00:00:00:00:00"
     try:
         return open(f"/sys/class/net/{iface}/address").read().strip().lower()
     except Exception: pass
@@ -307,12 +352,9 @@ def get_subnet(iface):
 def _resolve_mdns(ip, timeout=1.0):
     """Query mDNS (224.0.0.251:5353) untuk hostname .local"""
     try:
-        # Build mDNS PTR query untuk reverse lookup
-        # e.g. 55.110.168.192.in-addr.arpa
         rev = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
         name_parts = rev.encode().split(b".")
 
-        # DNS query packet
         txid   = b"\x00\x01"
         flags  = b"\x00\x00"
         qdcnt  = b"\x00\x01"
@@ -326,43 +368,34 @@ def _resolve_mdns(ip, timeout=1.0):
             qname += bytes([len(part)]) + part
         qname += b"\x00"
         qtype  = b"\x00\x0c"  # PTR
-        qclass = b"\x00\x01"  # IN (unicast bit NOT set for mDNS compat)
+        qclass = b"\x00\x01"  # IN
         query  = header + qname + qtype + qclass
 
         s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         s.settimeout(timeout)
         s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-        # Send directly to host (unicast mDNS query)
         s.sendto(query, (ip, 5353))
         data, _ = s.recvfrom(512)
         s.close()
 
-        # Parse answer section — cari string setelah header (12 bytes) + question
-        # Simple: cari null-terminated label setelah RDATA
-        # Cukup grep printable string dari response
-        idx = 12 + len(qname) + 4  # skip header + question
+        idx = 12 + len(qname) + 4
         if idx >= len(data): return None
 
-        # Skip pointer/labels di answer, ambil RDATA
-        # Cari nama di answer: skip name(2 byte ptr atau labels), type(2), class(2), ttl(4), rdlen(2)
         i = idx
-        # skip name
         while i < len(data):
             ll = data[i]
             if ll == 0: i += 1; break
             if ll & 0xc0 == 0xc0: i += 2; break
             i += 1 + ll
-        i += 10  # type + class + ttl + rdlen
+        i += 10
         if i >= len(data): return None
 
-        # Parse rdata labels
         name = []
         while i < len(data):
             ll = data[i]
             if ll == 0: break
             if ll & 0xc0 == 0xc0:
                 ptr = ((ll & 0x3f) << 8) | data[i+1]
-                # Follow pointer — parse from that offset
                 j = ptr
                 while j < len(data):
                     l2 = data[j]
@@ -384,15 +417,12 @@ def _resolve_mdns(ip, timeout=1.0):
 def _resolve_netbios(ip, timeout=1.0):
     """Query NetBIOS Name Service (UDP 137) untuk Windows/Samba hostname."""
     try:
-        # NBNS query: node status request
         txid   = b"\xab\xcd"
         flags  = b"\x00\x00"
         qdcnt  = b"\x00\x01"
         ancnt  = b"\x00\x00"
         nscnt  = b"\x00\x00"
         arcnt  = b"\x00\x00"
-        # Encoded wildcard name "*" padded to 16 bytes, L1-encoded
-        # "*\x00" + 14 bytes null, then L2 null
         raw_name = b"\x20" + b"CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + b"\x00"
         qtype  = b"\x00\x21"  # NBSTAT
         qclass = b"\x00\x01"
@@ -404,8 +434,6 @@ def _resolve_netbios(ip, timeout=1.0):
         data, _ = s.recvfrom(1024)
         s.close()
 
-        # Response: skip 56 bytes header area, then num_names (1 byte)
-        # Each name: 15 bytes name + 1 byte type + 2 bytes flags
         if len(data) < 57: return None
         num = data[56]
         for i in range(num):
@@ -430,11 +458,6 @@ def _resolve_rdns(ip, timeout=1.0):
 
 
 def resolve_hostname(ip, timeout=1.0):
-    """
-    Resolve hostname dengan 3 metode paralel:
-    mDNS (.local), NetBIOS (Windows), reverse DNS.
-    Return string atau "" kalau semua gagal.
-    """
     results = {}
     lock    = threading.Lock()
 
@@ -444,19 +467,17 @@ def resolve_hostname(ip, timeout=1.0):
             with lock: results[key] = r
 
     threads = [
-        threading.Thread(target=_run, args=(_resolve_mdns,   "mdns"),    daemon=True),
+        threading.Thread(target=_run, args=(_resolve_mdns,    "mdns"),    daemon=True),
         threading.Thread(target=_run, args=(_resolve_netbios, "netbios"), daemon=True),
-        threading.Thread(target=_run, args=(_resolve_rdns,   "rdns"),    daemon=True),
+        threading.Thread(target=_run, args=(_resolve_rdns,    "rdns"),    daemon=True),
     ]
     for t in threads: t.start()
     for t in threads: t.join(timeout=timeout + 0.2)
 
-    # Prioritas: mDNS > NetBIOS > rDNS
     return results.get("mdns") or results.get("netbios") or results.get("rdns") or ""
 
 
 def resolve_hostnames_bulk(ip_list, timeout=1.0, max_workers=30):
-    """Resolve hostname untuk banyak IP secara paralel."""
     results = {}
     lock    = threading.Lock()
     sem     = threading.Semaphore(max_workers)
@@ -497,7 +518,6 @@ def load(p):
         data = json.loads(p.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except (OSError, UnicodeError, json.JSONDecodeError):
-        # A damaged settings file should not prevent the app from starting.
         return {}
 
 def save(p, d):
@@ -534,13 +554,38 @@ class Spoofer:
         self._running = False
         self._thread = None
         self._fwd_orig = None
+        self._sock = None
+        self._raw_sock = None
+
+    def _get_sock(self):
+        if self._sock is None and SCAPY_OK:
+            from scapy.all import conf
+            self._sock = conf.L2socket(iface=self.iface)
+        return self._sock
+
+    def _get_raw_sock(self):
+        if self._raw_sock is None and not SCAPY_OK and not IS_WINDOWS:
+            self._raw_sock = _socket.socket(_socket.AF_PACKET, _socket.SOCK_RAW, _socket.htons(0x0806))
+            self._raw_sock.bind((self.iface, 0))
+        return self._raw_sock
+
+    def _close_socks(self):
+        if self._sock is not None:
+            try: self._sock.close()
+            except Exception: pass
+            self._sock = None
+        if self._raw_sock is not None:
+            try: self._raw_sock.close()
+            except Exception: pass
+            self._raw_sock = None
 
     def _start_thread(self):
         if self._running: return
         self._running = True
-        if self._fwd_orig is None:
-            self._fwd_orig = sh(f"{SYSCTL} -n {IP_FWD}")
-        shq(f"{SYSCTL} -w {IP_FWD}=1")
+        if not IS_WINDOWS:
+            if self._fwd_orig is None:
+                self._fwd_orig = sh(f"{SYSCTL} -n {IP_FWD}")
+            shq(f"{SYSCTL} -w {IP_FWD}=1")
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -558,18 +603,32 @@ class Spoofer:
             ipaddress.IPv4Address(ip)
         except ValueError:
             return
-        if IS_WINDOWS:
+        if IS_WINDOWS and not SCAPY_OK:
             return
         if SCAPY_OK:
-            sendp(Ether(dst=self.gw_mac)/ARP(op=2, psrc=ip, pdst=self.gw_ip, hwdst=self.gw_mac, hwsrc=self.local_mac), verbose=0, iface=self.iface)
-            sendp(Ether(dst=mac)/ARP(op=2, psrc=self.gw_ip, pdst=ip, hwdst=mac, hwsrc=self.local_mac), verbose=0, iface=self.iface)
+            s = self._get_sock()
+            if s is None: return
+            try:
+                s.send(Ether(dst=self.gw_mac)/ARP(op=2, psrc=ip, pdst=self.gw_ip, hwdst=self.gw_mac, hwsrc=self.local_mac))
+                s.send(Ether(dst=mac)/ARP(op=2, psrc=self.gw_ip, pdst=ip, hwdst=mac, hwsrc=self.local_mac))
+            except Exception:
+                self._close_socks()
         else:
-            _send_raw_arp(self.iface, _arp_packet(self.local_mac, self.local_mac, self.gw_ip, mac, mac, ip, op=2))
-            _send_raw_arp(self.iface, _arp_packet(self.local_mac, self.local_mac, ip, self.gw_mac, self.gw_mac, self.gw_ip, op=2))
+            rs = self._get_raw_sock()
+            pkt1 = _arp_packet(self.local_mac, self.local_mac, self.gw_ip, mac, mac, ip, op=2)
+            pkt2 = _arp_packet(self.local_mac, self.local_mac, ip, self.gw_mac, self.gw_mac, self.gw_ip, op=2)
+            if rs is not None:
+                try:
+                    rs.send(pkt1); rs.send(pkt2)
+                except Exception:
+                    self._close_socks()
+            else:
+                _send_raw_arp(self.iface, pkt1)
+                _send_raw_arp(self.iface, pkt2)
 
     def add(self, ip, mac):
         try:
-            if IS_WINDOWS or ipaddress.ip_address(ip).version != 4:
+            if (IS_WINDOWS and not SCAPY_OK) or ipaddress.ip_address(ip).version != 4:
                 return
         except ValueError:
             return
@@ -595,14 +654,17 @@ class Spoofer:
                     return
                 original = self._fwd_orig
                 self._fwd_orig = None
-            shq(f"{SYSCTL} -w {IP_FWD}={original or '0'}")
-            # Never flush global conntrack; unrelated connections must survive.
+            if not IS_WINDOWS:
+                shq(f"{SYSCTL} -w {IP_FWD}={original or '0'}")
+            self._close_socks()
         if wait:
             stop_now()
         else:
             threading.Thread(target=stop_now, daemon=True).start()
 
     def _restore(self, ip, mac):
+        if IS_WINDOWS and not SCAPY_OK:
+            return
         for _ in range(4):
             if SCAPY_OK:
                 sendp(Ether(dst=self.gw_mac)/ARP(op=2, psrc=ip, hwsrc=mac, pdst=self.gw_ip, hwdst=BROADCAST), verbose=0, iface=self.iface)
@@ -680,18 +742,16 @@ class Limiter:
         except ValueError:
             return False
         if IS_WINDOWS:
-            # This restricts communication between this PC and the given remote
-            # host; it cannot disconnect that host from the network itself.
             name = "NetBand-" + parsed_ip.compressed.replace(":", "-").replace(".", "-")
             remote = parsed_ip.compressed
             self._unlimit(ip)
             commands = []
             if direction & Dir.UP:
-                commands.append(f"New-NetFirewallRule -DisplayName '{name}-Out' -Direction Outbound -RemoteAddress '{remote}' -Action Block -Profile Any -ErrorAction Stop | Out-Null")
+                commands.append(f'netsh advfirewall firewall add rule name="{name}-Out" dir=out action=block remoteip={remote} profile=any')
             if direction & Dir.DOWN:
-                commands.append(f"New-NetFirewallRule -DisplayName '{name}-In' -Direction Inbound -RemoteAddress '{remote}' -Action Block -Profile Any -ErrorAction Stop | Out-Null")
+                commands.append(f'netsh advfirewall firewall add rule name="{name}-In" dir=in action=block remoteip={remote} profile=any')
             if not commands or any(shq(command) != 0 for command in commands):
-                shq(f"Get-NetFirewallRule -DisplayName '{name}-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule")
+                self._unlimit(ip)
                 return False
             with self._lock:
                 self._hosts[ip] = {"ids": {"uid": 0, "did": 0}, "rate": None, "dir": direction, "blocked": True}
@@ -717,8 +777,8 @@ class Limiter:
     def _unlimit(self, ip):
         if IS_WINDOWS:
             name = "NetBand-" + ip.replace(":", "-").replace(".", "-")
-            shq(f"Get-NetFirewallRule -DisplayName '{name}-Out' -ErrorAction SilentlyContinue | Remove-NetFirewallRule")
-            shq(f"Get-NetFirewallRule -DisplayName '{name}-In' -ErrorAction SilentlyContinue | Remove-NetFirewallRule")
+            shq(f'netsh advfirewall firewall delete rule name="{name}-Out"')
+            shq(f'netsh advfirewall firewall delete rule name="{name}-In"')
             with self._lock:
                 return self._hosts.pop(ip, None) is not None
         with self._lock:
@@ -778,11 +838,11 @@ class Limiter:
 
     def flush(self, all_rules=False):
         if IS_WINDOWS:
-            shq("Get-NetFirewallRule -DisplayName 'NetBand-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule")
-            with self._lock: self._hosts.clear()
+            with self._lock:
+                ips = list(self._hosts)
+            for ip in ips:
+                self._unlimit(ip)
             return
-        # Never flush global iptables chains: those may contain firewall rules
-        # owned by Docker, VPNs, the OS, or other applications.
         with self._lock:
             ips = list(self._hosts)
         for ip in ips:
@@ -843,7 +903,6 @@ def _scan_phase_raw_arp(iface, ips, local_mac, local_ip):
     for idx, ip in enumerate(ips):
         pkt = _arp_packet(local_mac, local_mac, local_ip, BROADCAST, BROADCAST, ip, op=1)
         _send_raw_arp(iface, pkt)
-        # Small pause tiap 50 paket biar kernel tidak drop
         if idx % 50 == 49:
             time.sleep(0.01)
 
@@ -891,17 +950,14 @@ def _read_neigh(iface):
         return result
     for line in sh(f"ip neigh show dev {shlex.quote(str(iface))}").splitlines():
         p = line.split()
-        # format: IP dev IFACE lladdr MAC STATE
         if len(p) < 4: continue
         ip = p[0]
-        # find lladdr
         try:
             ll_idx = p.index("lladdr")
             mac = p[ll_idx + 1].lower()
         except (ValueError, IndexError):
             continue
         if mac == "00:00:00:00:00:00" or ":" not in mac: continue
-        # Accept all non-failed states
         state = p[-1].upper() if p else ""
         if state in ("FAILED", "INCOMPLETE", "NONE"): continue
         result[ip] = mac
@@ -909,7 +965,6 @@ def _read_neigh(iface):
 
 
 def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
-    # Get local info before selecting the subnet to scan.
     if spoofer and spoofer.local_mac and spoofer.local_ip:
         local_mac = spoofer.local_mac
         local_ip  = spoofer.local_ip
@@ -921,39 +976,29 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
 
     print(f"{C.DIM}Scanning {len(ips)} addresses...{C.RST}")
 
-    # Flush stale entries (non-blocking)
     if not IS_WINDOWS:
         shq(f"ip neigh flush dev {shlex.quote(str(iface))} nud failed 2>/dev/null")
         shq(f"ip neigh flush dev {shlex.quote(str(iface))} nud incomplete 2>/dev/null")
         shq(f"ip neigh flush dev {shlex.quote(str(iface))} nud none 2>/dev/null")
+        if local_mac and local_ip and local_mac != "00:00:00:00:00:00":
+            print(f"{C.DIM}  ARP blast...{C.RST}", end="\r", flush=True)
+            _scan_phase_raw_arp(iface, ips, local_mac, local_ip)
+        else:
+            print(f"{C.YEL}  [!] Could not get local MAC{C.RST}")
 
-    # Phase 1: raw ARP blast (sangat cepat, ~0.1-0.5s untuk 254 IP)
-    if not IS_WINDOWS and local_mac and local_ip and local_mac != "00:00:00:00:00:00":
-        print(f"{C.DIM}  ARP blast...{C.RST}", end="\r", flush=True)
-        _scan_phase_raw_arp(iface, ips, local_mac, local_ip)
-    else:
-        print(f"{C.YEL}  [!] Could not get local MAC{C.RST}")
-
-    # Phase 2: async ping untuk host yang butuh ICMP (fire and forget)
     print(f"{C.DIM}  Waiting for replies...{C.RST}", end="\r", flush=True)
     _scan_phase_ping_async(ips)
-
-    # Tunggu reply ARP masuk — cukup 1.5s
     time.sleep(1.5)
+    print(f"                                \r", end="", flush=True)
 
-    print(f"                               \r", end="", flush=True)
-
-    # Read existing saved devices
     devices = load(DEVICES_FILE)
     active_devices = {}
 
-    # Keep limited hosts even if offline
     for mac, d in devices.items():
         if limiter and limiter.is_limited(d["ip"]):
             d["online"] = False
             active_devices[mac] = d
 
-    # Read neighbour table
     neigh = _read_neigh(iface)
 
     seen_macs = set()
@@ -961,7 +1006,7 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
     for ip, mac in neigh.items():
         try: ipaddress.IPv4Address(ip)
         except ValueError: continue
-        if ip not in scanned_ips:
+        if ip == local_ip or ip not in scanned_ips:
             continue
         if mac in seen_macs: continue
         seen_macs.add(mac)
@@ -979,7 +1024,6 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
                 "hostname": "", "limits": {}, "online": True
             }
 
-    # Resolve hostnames untuk host baru (yang belum punya nama)
     need_resolve = [
         d["ip"] for d in active_devices.values()
         if d.get("online") and not d.get("hostname")
@@ -991,9 +1035,8 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
             ip = d["ip"]
             if ip in resolved and resolved[ip]:
                 d["hostname"] = resolved[ip]
-        print(f"                                        \r", end="", flush=True)
+        print(f"                                            \r", end="", flush=True)
 
-    # Ensure gateway is always present
     if gw_mac:
         gw_mac_lower = gw_mac.lower()
         if gw_mac_lower not in active_devices:
@@ -1007,7 +1050,6 @@ def scan(iface, gw_ip, custom=None, limiter=None, spoofer=None, gw_mac=None):
                     "hostname": "gateway", "limits": {}, "online": True
                 }
 
-    # Separate gateway for pinning to ID 0
     gw_device = None
     if gw_mac:
         gw_device = active_devices.pop(gw_mac.lower(), None)
@@ -1119,7 +1161,7 @@ def parse_ids(raw, devices):
 # ── banner ───────────────────────────────────────────────────────────
 
 def print_banner(iface, gw_ip, gw_mac, local_ip):
-    mode = f" {C.YEL}[Windows local-firewall mode]{C.RST}" if IS_WINDOWS else (f" {C.YEL}[Android/raw-socket mode]{C.RST}" if IS_ANDROID else "")
+    mode = f" {C.YEL}[Windows {'ARP+firewall' if SCAPY_OK else 'local-firewall'} mode]{C.RST}" if IS_WINDOWS else (f" {C.YEL}[Android/raw-socket mode]{C.RST}" if IS_ANDROID else "")
     print("")
     print(f"""{C.RED}   ███╗  ██╗███████╗████████╗██████╗  █████╗ ███╗  ██╗██████╗
    ████╗ ██║██╔════╝╚══██╔══╝██╔══██╗██╔══██╗████╗ ██║██╔══██╗
@@ -1141,15 +1183,15 @@ def print_help():
     print(f"""
 {C.BLD}Commands:{C.RST}
   {C.CYN}scan{C.RST} [--range IP-IP]       Scan network for hosts
-  {C.CYN}hosts{C.RST} [--force]             Show discovered hosts
+  {C.CYN}hosts{C.RST} [--force]            Show discovered hosts
   {C.CYN}limit{C.RST} IDs RATE [--upload|--download]
   {C.CYN}block{C.RST} IDs [--upload|--download]
-  {C.CYN}free{C.RST} IDs|all                Remove limits/blocks
-  {C.CYN}add{C.RST} IP [--mac MAC]          Add custom host
+  {C.CYN}free{C.RST} IDs|all               Remove limits/blocks
+  {C.CYN}add{C.RST} IP [--mac MAC]         Add custom host
   {C.CYN}monitor{C.RST} [--interval MS]    Monitor limited hosts
   {C.CYN}analyze{C.RST} IDs [--duration S] Analyze without limiting
-  {C.CYN}status{C.RST}                      Show active limits/blocks
-  {C.CYN}watch{C.RST}                       Show watch status
+  {C.CYN}status{C.RST}                     Show active limits/blocks
+  {C.CYN}watch{C.RST}                      Show watch status
   {C.CYN}watch add{C.RST} IDs              Add hosts to watchlist
   {C.CYN}watch remove{C.RST} IDs|all       Remove from watchlist
   {C.CYN}watch set{C.RST} ATTR VAL         Set watch attribute
@@ -1195,7 +1237,7 @@ def _print_host_table(devices, gw_ip, limiter):
             stat_raw, stat_color = "Free", C.GRN
         elif info:
             if info["blocked"]:
-                stat_raw, stat_color = ("Firewall", C.RED) if IS_WINDOWS else ("Blocked", C.RED)
+                stat_raw, stat_color = ("Firewall", C.RED) if (IS_WINDOWS and not SCAPY_OK) else ("Blocked", C.RED)
             else:
                 stat_raw, stat_color = "Limited", C.YEL
         elif not is_online:
@@ -1227,11 +1269,10 @@ def main():
     if args.colorless: no_color()
 
     if IS_WINDOWS:
-        try:
-            elevated = bool(sh("([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)").lower() == "true")
-        except Exception: elevated = False
-        if not elevated:
-            print(f"{C.RED}Run PowerShell as Administrator.{C.RST}"); sys.exit(1)
+        if not ctypes.windll.shell32.IsUserAnAdmin():
+            params = subprocess.list2cmdline([os.path.abspath(sys.argv[0]), *sys.argv[1:]])
+            rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+            sys.exit(0 if rc > 32 else 1)
     elif os.geteuid() != 0:
         print(f"{C.RED}Must run as root.{C.RST}"); sys.exit(1)
 
@@ -1242,22 +1283,18 @@ def main():
         Limiter(iface).flush(all_rules=True)
         print(f"{C.GRN}Cleanup completed for rules tracked by this process.{C.RST}"); return
 
-    iface  = args.i
-    gw_ip  = args.g
+    iface = args.i
+    gw_ip = args.g
     if not iface or not gw_ip:
-        det_iface, det_gw = _detect_network()
-        if not iface:  iface  = det_iface or detect_iface()
-        if not gw_ip:  gw_ip  = det_gw    or detect_gw(iface)
+        det_iface, det_gw = _detect_network(iface)
+        if not iface: iface = det_iface
+        if not gw_ip: gw_ip = det_gw or detect_gw(iface)
 
     gw_mac = args.m
     if not gw_mac and gw_ip:
         gw_mac = get_mac(gw_ip, iface)
-        if not gw_mac:
-            if IS_WINDOWS:
-                subprocess.run(["ping", "-n", "1", "-w", "1000", gw_ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                shq(f"ping -c 1 -W 1 {gw_ip}")
-            gw_mac = get_mac(gw_ip, iface)
+        if not gw_mac and IS_WINDOWS:
+            gw_mac = "00:00:00:00:00:00"
 
     if not iface:  print(f"{C.RED}No interface. Use -i.{C.RST}"); sys.exit(1)
     if not gw_ip:  print(f"{C.RED}No gateway. Use -g.{C.RST}");   sys.exit(1)
@@ -1343,7 +1380,7 @@ def main():
                 print(f"{C.RED}No matching hosts.{C.RST}"); continue
             success_ips = []
             for d in devs:
-                if d["ip"] == gw_ip: continue
+                if d["ip"] in (gw_ip, local_ip): continue
                 if limiter.limit(d["ip"], rate, direction):
                     spoofer.add(d["ip"], d["mac"])
                     d["limits"] = {"rate": rate, "direction": direction}
@@ -1363,17 +1400,20 @@ def main():
             devs = parse_ids(w[0], devices)
             if not devs:
                 print(f"{C.RED}No matching hosts.{C.RST}"); continue
+            blocked_ips = []
             for d in devs:
-                if d["ip"] == gw_ip: continue
+                if d["ip"] in (gw_ip, local_ip): continue
                 if limiter.block(d["ip"], direction):
                     spoofer.add(d["ip"], d["mac"])
                     d["limits"] = {"rate": None, "direction": direction, "blocked": True}
-                    if IS_WINDOWS:
-                        print(f"{C.YEL}Added local firewall rules for {d['ip']}. This only affects this PC, not the remote device.{C.RST}")
-                    else:
-                        print(f"{C.RED}Blocked {d['ip']}{C.RST}")
+                    blocked_ips.append(d["ip"])
                 else:
                     print(f"{C.RED}Failed to block {d['ip']}{C.RST}")
+            if blocked_ips:
+                if IS_WINDOWS and not SCAPY_OK:
+                    print(f"{C.YEL}Added local firewall rules for {', '.join(blocked_ips)} (install scapy + Npcap for LAN ARP blocking).{C.RST}")
+                else:
+                    print(f"{C.RED}Blocked {', '.join(blocked_ips)}{C.RST}")
             save(DEVICES_FILE, devices)
 
         # ── free ──────────────────────────────────────────────────────
@@ -1384,7 +1424,7 @@ def main():
             if not devs:
                 print(f"{C.RED}No matching hosts.{C.RST}"); continue
             for d in devs:
-                if d["ip"] == gw_ip: continue
+                if d["ip"] in (gw_ip, local_ip): continue
                 limiter.unlimit(d["ip"])
                 spoofer.remove(d["ip"])
                 d["limits"] = {}
@@ -1638,7 +1678,6 @@ def _logic_selftest():
     try:
         _build_ip_list("192.168.1.1", "192.168.1.254-192.168.2.10")
     except ValueError:
-        # Cross-octet ranges are valid IP ranges; count is small and should pass.
         raise AssertionError("valid IPv4 range was rejected")
     try:
         _build_ip_list("192.168.1.1", "0.0.0.0-255.255.255.255")
@@ -1647,7 +1686,6 @@ def _logic_selftest():
     else:
         raise AssertionError("unbounded range should be rejected")
 
-    # Verify state bookkeeping without touching system firewall/qdisc rules.
     global shq, sh, IS_WINDOWS
     old_shq, old_sh, old_windows = shq, sh, IS_WINDOWS
     try:
@@ -1665,15 +1703,14 @@ def _logic_selftest():
         assert obj.unlimit("192.0.2.10")
         assert not obj.is_limited("192.0.2.10")
 
-        # Check Windows command routing without invoking PowerShell.
         IS_WINDOWS = True
         commands = []
         shq = lambda command: (commands.append(command) or 0)
         win = Limiter("Wi-Fi")
         assert win.block("192.0.2.20", Dir.BOTH)
-        assert sum("New-NetFirewallRule" in c for c in commands) == 2
+        assert sum("advfirewall firewall add rule" in c for c in commands) == 2
         win.unlimit("192.0.2.20")
-        assert any("Remove-NetFirewallRule" in c for c in commands)
+        assert any("advfirewall firewall delete rule" in c for c in commands)
         with contextlib.redirect_stdout(io.StringIO()):
             assert win.limit("192.0.2.20", "1mbit", Dir.BOTH) is False
     finally:
